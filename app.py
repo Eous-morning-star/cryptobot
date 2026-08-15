@@ -10,19 +10,30 @@ Routes:
   GET /                 -> the dashboard page (HTML)
   GET /api/score?address=<mint>   -> run the full multi-source scorecard
   GET /api/pools?q=<query>        -> DexScreener pool search
+  GET /api/scan?...                -> score a batch of currently-boosted tokens
+                                       and return only the ones that pass your
+                                       filters, ranked -- the "find me something
+                                       to buy" button.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
+import aiohttp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from tokenscore.bot.dexscreener import DexScreener
+from tokenscore.bot.dexscreener import DexScreener, extract_address
 from tokenscore.scoring.engine import evaluate_token
 from tokenscore.sources.adapters import ALL_ADAPTERS
 
 app = FastAPI(title="TokenScore")
+
+# Cap concurrent full evaluations, same reasoning as the Telegram bot: each
+# one fans out to up to 5 APIs, so scanning 20 tokens with no cap would burn
+# free-tier quotas (and this bot's own courtesy) in one click.
+SCAN_SEMAPHORE = asyncio.Semaphore(4)
 
 
 def build_adapters():
@@ -78,6 +89,99 @@ async def api_pools(q: str = Query(..., min_length=1, max_length=64)):
             }
         )
     return JSONResponse({"query": q, "results": results})
+
+
+async def _evaluate_one(address: str, session: aiohttp.ClientSession):
+    async with SCAN_SEMAPHORE:
+        return await evaluate_token(build_adapters(), address, session=session)
+
+
+async def _scan_candidates(source: str, limit: int) -> list[dict]:
+    try:
+        async with DexScreener() as ds:
+            entries = await (ds.top_boosts() if source == "alpha" else ds.latest_boosts())
+    except Exception as exc:  # noqa: BLE001 - surface as a clean 502, not a 500 traceback
+        raise HTTPException(status_code=502, detail=f"couldn't pull the candidate list: {exc}") from exc
+
+    seen: set[str] = set()
+    addresses: list[str] = []
+    for e in entries:
+        if e.get("chainId") != "solana":
+            continue
+        addr = extract_address(e)
+        if addr and addr not in seen:
+            seen.add(addr)
+            addresses.append(addr)
+    addresses = addresses[:limit]
+
+    async with aiohttp.ClientSession() as session:
+        verdicts = await asyncio.gather(
+            *(_evaluate_one(a, session) for a in addresses),
+            return_exceptions=True,
+        )
+
+    rows = []
+    for addr, v in zip(addresses, verdicts):
+        if isinstance(v, Exception):
+            continue
+        ds_data = (v.breakdown or {}).get("dexscreener", {})
+        rows.append(
+            {
+                "address": addr,
+                "score": v.score,
+                "confidence": v.confidence,
+                "gated": v.verdict == "GATED",
+                "gate_failures": v.gate_failures,
+                "liquidity_usd": ds_data.get("liquidity_usd"),
+                "volume_h24": ds_data.get("volume_h24"),
+                "disagreements": v.disagreements,
+            }
+        )
+    return rows
+
+
+@app.get("/api/scan")
+async def api_scan(
+    source: str = Query("alpha", pattern="^(alpha|screen)$"),
+    min_score: float = Query(70, ge=0, le=100),
+    min_confidence: float = Query(0.6, ge=0, le=1),
+    require_agreement: bool = Query(True),
+    limit: int = Query(20, ge=1, le=30),
+):
+    """
+    source=alpha  -> pulls DexScreener's top-boosted list (teams paying to be
+                     seen), the same pool /alpha draws from in the bot.
+    source=screen -> pulls the latest-boosted list instead, broader and
+                     noisier, same as /screen.
+    Either way: every candidate is fully scored, then filtered down to what
+    actually clears your thresholds -- nothing here is a raw popularity list.
+    """
+    rows = await _scan_candidates(source, limit)
+
+    passed = [
+        r
+        for r in rows
+        if not r["gated"]
+        and (r["score"] or 0) >= min_score
+        and r["confidence"] >= min_confidence
+        and (not require_agreement or not r["disagreements"])
+    ]
+    passed.sort(key=lambda r: (r["score"] or 0), reverse=True)
+
+    return JSONResponse(
+        {
+            "evaluated": len(rows),
+            "gated": sum(1 for r in rows if r["gated"]),
+            "passed": passed,
+            "filters": {
+                "source": source,
+                "min_score": min_score,
+                "min_confidence": min_confidence,
+                "require_agreement": require_agreement,
+                "limit": limit,
+            },
+        }
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -226,6 +330,25 @@ INDEX_HTML = r"""<!doctype html>
   .pool-addr { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
                color: var(--text-muted); margin-top: 4px; word-break: break-all; }
 
+  .filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-bottom: 12px; }
+  .filter-grid label, .checkbox-row {
+    font-size: 12.5px; font-weight: 600; color: var(--text-secondary);
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .filter-grid select, .filter-grid input[type=number] {
+    font: inherit; font-size: 14px; padding: 9px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--page); color: var(--text-primary);
+  }
+  .checkbox-row { flex-direction: row; align-items: center; gap: 8px; font-weight: 500; }
+  .checkbox-row input { width: 16px; height: 16px; }
+
+  .scan-row { display: grid; grid-template-columns: 44px 1fr auto; gap: 12px; align-items: center;
+              padding: 12px 0; border-bottom: 1px solid var(--gridline); }
+  .scan-row:last-child { border-bottom: none; }
+  .scan-rank { font-size: 13px; font-weight: 700; color: var(--text-muted); text-align: center; }
+  .scan-score { font-size: 18px; font-weight: 700; text-align: right; white-space: nowrap; }
+  .scan-score small { font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; }
+
   .error-box { border: 1px solid var(--critical); background: color-mix(in srgb, var(--critical) 10%, transparent);
                color: var(--text-primary); border-radius: 8px; padding: 12px 14px; font-size: 13.5px; margin-top: 16px; }
   .empty { color: var(--text-muted); font-size: 13.5px; padding: 20px 0; text-align: center; }
@@ -245,6 +368,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="tabs" role="tablist">
       <button class="tab" id="tab-score" role="tab" aria-selected="true">Check a token</button>
       <button class="tab" id="tab-pools" role="tab" aria-selected="false">Search pools</button>
+      <button class="tab" id="tab-scan" role="tab" aria-selected="false">Scan for buys</button>
     </div>
 
     <div class="panel active" id="panel-score">
@@ -264,6 +388,33 @@ INDEX_HTML = r"""<!doctype html>
       <p class="hint">Free-text pool search via DexScreener.</p>
       <div id="pools-result"></div>
     </div>
+
+    <div class="panel" id="panel-scan">
+      <div class="filter-grid">
+        <label>List
+          <select id="scan-source">
+            <option value="alpha">Top boosted (alpha)</option>
+            <option value="screen">Latest boosted (screen)</option>
+          </select>
+        </label>
+        <label>Min score
+          <input type="number" id="scan-min-score" value="70" min="0" max="100" step="1">
+        </label>
+        <label>Min confidence %
+          <input type="number" id="scan-min-conf" value="60" min="0" max="100" step="5">
+        </label>
+        <label>Tokens to scan
+          <input type="number" id="scan-limit" value="20" min="5" max="30" step="5">
+        </label>
+      </div>
+      <label class="checkbox-row">
+        <input type="checkbox" id="scan-agreement" checked>
+        Require multi-source agreement (no conflicting signals)
+      </label>
+      <button id="scan-btn" style="width:100%; margin-top:14px;">Scan now</button>
+      <p class="hint">Every candidate gets the full multi-source scorecard before filtering &mdash; this is not a raw popularity list. Click when you want a fresh read; each scan is dozens of live API calls, so it's meant to be run deliberately, not on a timer.</p>
+      <div id="scan-result"></div>
+    </div>
   </div>
 
   <footer>
@@ -275,17 +426,15 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 
+const TABS = ['score', 'pools', 'scan'];
 function switchTab(which) {
-  const scoreTab = $('tab-score'), poolsTab = $('tab-pools');
-  const scorePanel = $('panel-score'), poolsPanel = $('panel-pools');
-  const onScore = which === 'score';
-  scoreTab.setAttribute('aria-selected', onScore);
-  poolsTab.setAttribute('aria-selected', !onScore);
-  scorePanel.classList.toggle('active', onScore);
-  poolsPanel.classList.toggle('active', !onScore);
+  TABS.forEach(name => {
+    const isActive = name === which;
+    $('tab-' + name).setAttribute('aria-selected', isActive);
+    $('panel-' + name).classList.toggle('active', isActive);
+  });
 }
-$('tab-score').addEventListener('click', () => switchTab('score'));
-$('tab-pools').addEventListener('click', () => switchTab('pools'));
+TABS.forEach(name => $('tab-' + name).addEventListener('click', () => switchTab(name)));
 
 function money(v) {
   if (v === null || v === undefined) return '?';
@@ -431,6 +580,63 @@ $('score-btn').addEventListener('click', runScore);
 $('address-input').addEventListener('keydown', e => { if (e.key === 'Enter') runScore(); });
 $('pools-btn').addEventListener('click', runPools);
 $('pools-input').addEventListener('keydown', e => { if (e.key === 'Enter') runPools(); });
+
+async function runScan() {
+  const source = $('scan-source').value;
+  const minScore = $('scan-min-score').value;
+  const minConf = (Number($('scan-min-conf').value) / 100).toFixed(2);
+  const agreement = $('scan-agreement').checked;
+  const limit = $('scan-limit').value;
+  const out = $('scan-result');
+
+  $('scan-btn').disabled = true;
+  $('scan-btn').textContent = 'Scanning ' + limit + ' tokens…';
+  out.innerHTML = '<div class="spinner">Scoring candidates across multiple sources — this can take a little while.</div>';
+
+  try {
+    const params = new URLSearchParams({
+      source, min_score: minScore, min_confidence: minConf,
+      require_agreement: agreement, limit,
+    });
+    const res = await fetch('/api/scan?' + params.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+    renderScan(data);
+  } catch (err) {
+    out.innerHTML = '<div class="error-box">' + (err.message || 'Something went wrong') + '</div>';
+  } finally {
+    $('scan-btn').disabled = false;
+    $('scan-btn').textContent = 'Scan now';
+  }
+}
+
+function renderScan(data) {
+  const out = $('scan-result');
+  let html = '<p class="note">' + data.evaluated + ' evaluated &middot; ' + data.gated
+    + ' gated out &middot; ' + data.passed.length + ' passed your filters, ranked by score.</p>';
+
+  if (!data.passed.length) {
+    html += '<div class="empty">Nothing cleared the bar this round &mdash; that\'s a valid result, not an error. Try again shortly or loosen the filters.</div>';
+    out.innerHTML = html;
+    return;
+  }
+
+  data.passed.forEach((r, i) => {
+    const status = statusForScore(r.score || 0);
+    html += '<div class="scan-row">'
+      + '<div class="scan-rank">' + (i + 1) + '</div>'
+      + '<div>'
+      + '<div class="pool-addr" style="margin-top:0">' + r.address + '</div>'
+      + '<div class="pool-meta">liq ' + money(r.liquidity_usd) + ' &middot; vol24 ' + money(r.volume_h24) + '</div>'
+      + '</div>'
+      + '<div class="scan-score" style="color:' + roleColor(status.role) + '">' + (r.score || 0).toFixed(0)
+      + '<small>' + (r.confidence * 100).toFixed(0) + '% conf</small></div>'
+      + '</div>';
+  });
+  out.innerHTML = html;
+}
+
+$('scan-btn').addEventListener('click', runScan);
 </script>
 </body>
 </html>
