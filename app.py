@@ -349,6 +349,16 @@ INDEX_HTML = r"""<!doctype html>
   .scan-score { font-size: 18px; font-weight: 700; text-align: right; white-space: nowrap; }
   .scan-score small { font-size: 11px; font-weight: 600; color: var(--text-muted); display: block; }
 
+  .link-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .link-chip {
+    font-size: 11.5px; font-weight: 600; color: var(--text-secondary);
+    text-decoration: none; padding: 4px 9px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--page);
+    white-space: nowrap;
+  }
+  .link-chip:hover { border-color: var(--seq-400); color: var(--seq-400); }
+  .scan-row .link-row { margin-top: 6px; }
+
   .error-box { border: 1px solid var(--critical); background: color-mix(in srgb, var(--critical) 10%, transparent);
                color: var(--text-primary); border-radius: 8px; padding: 12px 14px; font-size: 13.5px; margin-top: 16px; }
   .empty { color: var(--text-muted); font-size: 13.5px; padding: 20px 0; text-align: center; }
@@ -446,6 +456,18 @@ function money(v) {
 function shortAddr(a) {
   return a && a.length > 12 ? a.slice(0, 4) + '…' + a.slice(-4) : a;
 }
+function explorerLinks(address) {
+  const links = [
+    { label: 'DexScreener', url: 'https://dexscreener.com/solana/' + address },
+    { label: 'Birdeye', url: 'https://birdeye.so/token/' + address + '?chain=solana' },
+    { label: 'RugCheck', url: 'https://rugcheck.xyz/tokens/' + address },
+    { label: 'GoPlus', url: 'https://gopluslabs.io/token-security/solana/' + address },
+    { label: 'Solscan', url: 'https://solscan.io/token/' + address },
+  ];
+  return '<div class="link-row">' + links.map(l =>
+    '<a class="link-chip" href="' + l.url + '" target="_blank" rel="noopener noreferrer">' + l.label + ' ↗</a>'
+  ).join('') + '</div>';
+}
 function statusForScore(score) {
   if (score >= 75) return { role: 'good', label: 'Low structural risk' };
   if (score >= 55) return { role: 'warning', label: 'Caution' };
@@ -482,6 +504,7 @@ function renderScore(v) {
       + '<span class="status-pill" style="background:' + roleColor('critical') + '">Rejected</span>'
       + '</div>';
     html += '<div class="addr">' + v.address + '</div>';
+    html += explorerLinks(v.address);
     html += '<div class="section-title">Fatal findings</div>';
     (v.gate_failures || []).forEach(g => {
       html += '<div class="finding gate"><span class="icon">✖</span><span>' + g + '</span></div>';
@@ -498,6 +521,7 @@ function renderScore(v) {
     + '</div>';
   html += '<div class="score-num">' + score.toFixed(0) + ' <small>/ 100</small></div>';
   html += '<div class="addr">' + v.address + '</div>';
+  html += explorerLinks(v.address);
 
   html += '<div class="meter-row"><div class="meter-label">Confidence</div>'
     + '<div class="meter-track"><div class="meter-fill" style="width:' + (v.confidence * 100).toFixed(0) + '%"></div></div>'
@@ -571,6 +595,7 @@ function renderPools(rows) {
       + '<div class="pool-meta">liq ' + money(p.liquidity_usd) + ' &middot; vol24 ' + money(p.volume_h24)
       + ' &middot; ' + arrow + ' ' + Math.abs(chg).toFixed(1) + '%</div>'
       + '<div class="pool-addr">' + (p.pair_address || '') + '</div>'
+      + (p.base_address ? explorerLinks(p.base_address) : '')
       + '</div>';
   });
   out.innerHTML = html + '</div>';
@@ -628,6 +653,7 @@ function renderScan(data) {
       + '<div>'
       + '<div class="pool-addr" style="margin-top:0">' + r.address + '</div>'
       + '<div class="pool-meta">liq ' + money(r.liquidity_usd) + ' &middot; vol24 ' + money(r.volume_h24) + '</div>'
+      + explorerLinks(r.address)
       + '</div>'
       + '<div class="scan-score" style="color:' + roleColor(status.role) + '">' + (r.score || 0).toFixed(0)
       + '<small>' + (r.confidence * 100).toFixed(0) + '% conf</small></div>'
