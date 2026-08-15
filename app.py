@@ -8,7 +8,13 @@ the same engine, not a rewrite of it.
 
 Routes:
   GET /                 -> the dashboard page (HTML)
-  GET /api/score?address=<mint>   -> run the full multi-source scorecard
+  GET /api/score?address=<mint or name/ticker>   -> run the full multi-source
+                                       scorecard. Accepts either a real mint
+                                       address, or a free-text name/ticker
+                                       (e.g. "ansem") which gets resolved to
+                                       an address via DexScreener search
+                                       first, same matching "Search pools"
+                                       already uses.
   GET /api/pools?q=<query>        -> DexScreener pool search
   GET /api/scan?...                -> score a batch of currently-boosted tokens
                                        and return only the ones that pass your
@@ -19,15 +25,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from tokenscore.bot.dexscreener import DexScreener, extract_address
+from tokenscore.bot.dexscreener import DexScreener, deepest_pair, extract_address
 from tokenscore.scoring.categories import build_analysis
 from tokenscore.scoring.engine import combine, evaluate_token
 from tokenscore.sources.adapters import ALL_ADAPTERS
+
+# Solana mint addresses are base58, 32-44 chars. Anything that doesn't match
+# this shape is treated as a name/ticker search instead of a literal address.
+_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 app = FastAPI(title="TokenScore")
 
@@ -45,9 +56,40 @@ def build_adapters():
     return adapters
 
 
+async def _resolve_to_address(query: str) -> tuple[str, str | None]:
+    """Accept either a literal mint address or a free-text name/ticker.
+
+    Returns (address, matched_symbol) -- matched_symbol is None when the
+    input was already a real address (nothing needed resolving), and set
+    when it was resolved from a search so the UI can show what matched.
+    """
+    if _ADDRESS_RE.match(query):
+        return query, None
+
+    try:
+        async with DexScreener() as ds:
+            pairs = await ds.search(query)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"couldn't search for \"{query}\": {exc}") from exc
+
+    solana_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+    best = deepest_pair(solana_pairs)
+    address = (best.get("baseToken") or {}).get("address") if best else None
+    if not address:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No Solana token found matching \"{query}\". Try the exact ticker, "
+                   f"or search it on the \"Search pools\" tab and paste the address instead.",
+        )
+    symbol = (best.get("baseToken") or {}).get("symbol") or query
+    return address, symbol
+
+
 @app.get("/api/score")
-async def api_score(address: str = Query(..., min_length=20, max_length=64)):
-    address = address.strip()
+async def api_score(address: str = Query(..., min_length=2, max_length=64)):
+    query = address.strip()
+    resolved_address, matched_symbol = await _resolve_to_address(query)
+
     adapters = build_adapters()
     # Fan out manually (rather than using engine.evaluate_token, which only
     # returns the Verdict) so we keep the raw per-source results too -- the
@@ -55,14 +97,16 @@ async def api_score(address: str = Query(..., min_length=20, max_length=64)):
     # weighted subscore/confidence breakdown that goes into Verdict.
     async with aiohttp.ClientSession() as session:
         results = list(await asyncio.gather(
-            *(a.evaluate(session, address, "solana") for a in adapters)
+            *(a.evaluate(session, resolved_address, "solana") for a in adapters)
         ))
-    verdict = combine(address, results)
+    verdict = combine(resolved_address, results)
     analysis = build_analysis(verdict, results)
 
     return JSONResponse(
         {
             "address": verdict.address,
+            "queried_as": query,
+            "matched_symbol": matched_symbol,
             "verdict": verdict.verdict,
             "score": verdict.score,
             "confidence": verdict.confidence,
@@ -419,10 +463,10 @@ INDEX_HTML = r"""<!doctype html>
 
     <div class="panel active" id="panel-score">
       <div class="search-row">
-        <input type="text" id="address-input" placeholder="Mint address, e.g. So11111111111111111111111111111111111111112" autocomplete="off">
+        <input type="text" id="address-input" placeholder="Name, ticker, or mint address — e.g. ansem or So111...112" autocomplete="off">
         <button id="score-btn">Check</button>
       </div>
-      <p class="hint">Runs DexScreener, RugCheck, and GoPlus (plus Birdeye/Solscan if API keys are configured) and combines them into one verdict.</p>
+      <p class="hint">Type a name/ticker or paste the mint address directly. Runs DexScreener, RugCheck, and GoPlus (plus Birdeye/Solscan if API keys are configured) and combines them into one verdict.</p>
       <div id="score-result"></div>
     </div>
 
@@ -580,6 +624,10 @@ function renderAnalysis(analysis) {
 function renderScore(v) {
   const out = $('score-result');
   let html = '<div class="result">';
+
+  if (v.matched_symbol) {
+    html += '<p class="hint" style="margin-bottom:12px">Matched "' + v.queried_as + '" &rarr; <b>' + v.matched_symbol + '</b> (highest-liquidity pool on DexScreener). Not the token you meant? Search it on "Search pools" and paste the exact address instead.</p>';
+  }
 
   if (v.verdict === 'GATED') {
     html += '<div class="badge-row">'
