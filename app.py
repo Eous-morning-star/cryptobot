@@ -25,7 +25,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from tokenscore.bot.dexscreener import DexScreener, extract_address
-from tokenscore.scoring.engine import evaluate_token
+from tokenscore.scoring.categories import build_analysis
+from tokenscore.scoring.engine import combine, evaluate_token
 from tokenscore.sources.adapters import ALL_ADAPTERS
 
 app = FastAPI(title="TokenScore")
@@ -48,7 +49,17 @@ def build_adapters():
 async def api_score(address: str = Query(..., min_length=20, max_length=64)):
     address = address.strip()
     adapters = build_adapters()
-    verdict = await evaluate_token(adapters, address)
+    # Fan out manually (rather than using engine.evaluate_token, which only
+    # returns the Verdict) so we keep the raw per-source results too -- the
+    # category checklist below needs the detailed raw fields, not just the
+    # weighted subscore/confidence breakdown that goes into Verdict.
+    async with aiohttp.ClientSession() as session:
+        results = list(await asyncio.gather(
+            *(a.evaluate(session, address, "solana") for a in adapters)
+        ))
+    verdict = combine(address, results)
+    analysis = build_analysis(verdict, results)
+
     return JSONResponse(
         {
             "address": verdict.address,
@@ -61,6 +72,7 @@ async def api_score(address: str = Query(..., min_length=20, max_length=64)):
             "breakdown": verdict.breakdown,
             "sources_ok": verdict.sources_ok,
             "sources_total": verdict.sources_total,
+            "analysis": analysis,
         }
     )
 
@@ -359,6 +371,30 @@ INDEX_HTML = r"""<!doctype html>
   .link-chip:hover { border-color: var(--seq-400); color: var(--seq-400); }
   .scan-row .link-row { margin-top: 6px; }
 
+  .analysis { margin-top: 26px; border-top: 1px solid var(--gridline); padding-top: 20px; }
+  .analysis-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 2px; }
+  .analysis-head h3 { font-size: 15px; margin: 0; }
+  .analysis-composite { font-size: 15px; font-weight: 700; }
+  .analysis-sub { font-size: 12px; color: var(--text-muted); margin: 0 0 16px; line-height: 1.5; }
+
+  .category-block { margin-bottom: 18px; border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .category-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .category-label { font-size: 13.5px; font-weight: 700; flex: 1; }
+  .category-weight { font-size: 11px; color: var(--text-muted); font-weight: 600; }
+  .category-score { font-size: 13.5px; font-weight: 700; font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
+  .category-note { font-size: 11.5px; color: var(--text-muted); margin: 6px 0 8px; line-height: 1.5; }
+
+  .check-item { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; padding: 5px 0; }
+  .check-icon { flex: none; width: 16px; height: 16px; border-radius: 50%; display: flex; align-items: center;
+                justify-content: center; font-size: 10px; font-weight: 700; color: #fff; margin-top: 1px; }
+  .check-icon.pass { background: var(--good); }
+  .check-icon.warn { background: var(--warning); color: #4a3400; }
+  .check-icon.fail { background: var(--critical); }
+  .check-icon.unknown { background: var(--text-muted); }
+  .check-body { flex: 1; }
+  .check-label { color: var(--text-primary); }
+  .check-detail { color: var(--text-secondary); font-size: 12px; margin-top: 1px; line-height: 1.4; }
+
   .error-box { border: 1px solid var(--critical); background: color-mix(in srgb, var(--critical) 10%, transparent);
                color: var(--text-primary); border-radius: 8px; padding: 12px 14px; font-size: 13.5px; margin-top: 16px; }
   .empty { color: var(--text-muted); font-size: 13.5px; padding: 20px 0; text-align: center; }
@@ -495,6 +531,52 @@ async function runScore() {
   }
 }
 
+function scoreColor(score) {
+  if (score === null || score === undefined) return roleColor('warning');
+  if (score >= 75) return roleColor('good');
+  if (score >= 40) return roleColor('warning');
+  return roleColor('critical');
+}
+
+function renderAnalysis(analysis) {
+  if (!analysis) return '';
+  let html = '<div class="analysis">';
+  html += '<div class="analysis-head"><h3>Due-diligence checklist</h3>'
+    + '<span class="analysis-composite" style="color:' + scoreColor(analysis.composite_score) + '">'
+    + (analysis.composite_score === null ? '—' : analysis.composite_score.toFixed(0) + ' / 100')
+    + '</span></div>';
+  html += '<p class="analysis-sub">Weighted by priority — contract safety first, narrative last '
+    + '(contract 25% &middot; liquidity 20% &middot; holders 15% &middot; volume 15% &middot; deployer 10% '
+    + '&middot; community 10% &middot; narrative 5%, unscored). '
+    + (analysis.rejected
+        ? 'This token failed a gate, so the checklist score is forced to 0 regardless of the rest — a contract or liquidity fail overrides everything below it.'
+        : 'A category with no available data is left out of the composite rather than scored as good or bad.')
+    + '</p>';
+
+  analysis.categories.forEach(cat => {
+    html += '<div class="category-block">';
+    html += '<div class="category-head">'
+      + '<span class="category-label">' + cat.label + '</span>'
+      + '<span class="category-weight">' + cat.weight + '%</span>'
+      + '<span class="category-score" style="color:' + scoreColor(cat.score) + '">'
+      + (cat.score === null ? '—' : cat.score.toFixed(0))
+      + '</span></div>';
+    if (cat.note) html += '<div class="category-note">' + cat.note + '</div>';
+    cat.items.forEach(item => {
+      const iconMap = { pass: '✓', warn: '!', fail: '✕', unknown: '?' };
+      html += '<div class="check-item">'
+        + '<span class="check-icon ' + item.status + '">' + iconMap[item.status] + '</span>'
+        + '<span class="check-body"><span class="check-label">' + item.label + '</span>'
+        + (item.detail ? '<div class="check-detail">' + item.detail + '</div>' : '')
+        + '</span></div>';
+    });
+    html += '</div>';
+  });
+
+  html += '</div>';
+  return html;
+}
+
 function renderScore(v) {
   const out = $('score-result');
   let html = '<div class="result">';
@@ -510,6 +592,7 @@ function renderScore(v) {
       html += '<div class="finding gate"><span class="icon">✖</span><span>' + g + '</span></div>';
     });
     html += '<p class="note">' + v.sources_ok + '/' + v.sources_total + ' sources reporting. Gated tokens are not scored — a single fatal finding rejects the token outright, regardless of anything else.</p>';
+    html += renderAnalysis(v.analysis);
     out.innerHTML = html + '</div>';
     return;
   }
@@ -559,6 +642,8 @@ function renderScore(v) {
   if (v.confidence < 0.6) {
     html += '<p class="note">Low confidence — sources missing or contradicting. Treat this score as weak evidence.</p>';
   }
+
+  html += renderAnalysis(v.analysis);
 
   out.innerHTML = html + '</div>';
 }

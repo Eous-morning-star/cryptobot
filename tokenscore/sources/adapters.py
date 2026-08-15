@@ -42,6 +42,10 @@ class DexScreenerAdapter(SourceAdapter):
         vol24 = float((pair.get("volume") or {}).get("h24") or 0)
         txns24 = pair.get("txns", {}).get("h24", {}) or {}
         buys, sells = int(txns24.get("buys") or 0), int(txns24.get("sells") or 0)
+        # marketCap is preferred when DexScreener has it; fdv (fully diluted)
+        # is the fallback for tokens where circulating supply isn't resolved.
+        market_cap = pair.get("marketCap") or pair.get("fdv")
+        market_cap = float(market_cap) if market_cap else None
 
         gates, flags = [], []
 
@@ -69,7 +73,8 @@ class DexScreenerAdapter(SourceAdapter):
             self.name, ok=True, subscore=clamp(subscore), confidence=0.9,
             gate_failures=gates, flags=flags,
             raw={"liquidity_usd": liq, "volume_h24": vol24,
-                 "buys": buys, "sells": sells, "pair": pair.get("pairAddress")},
+                 "buys": buys, "sells": sells, "pair": pair.get("pairAddress"),
+                 "market_cap": market_cap},
         )
 
 
@@ -100,11 +105,60 @@ class RugCheckAdapter(SourceAdapter):
             elif level == "warn":
                 flags.append(f"rugcheck:{label}")
 
+        # RugCheck maintains its own "already confirmed rugged" flag on some
+        # tokens. This is about as unambiguous as a signal gets.
+        if data.get("rugged") is True:
+            gates.append("rugcheck_marked_rugged")
+
         # RugCheck's own score: LOWER is safer. Invert it.
         raw_score = data.get("score_normalised", data.get("score"))
         subscore = None
         if raw_score is not None:
             subscore = clamp(1.0 - (float(raw_score) / 100.0))
+
+        # --- Deployer history -------------------------------------------
+        # "creatorTokens" is undocumented and not populated for every token
+        # (verified null on several live tokens) -- treat it as a bonus
+        # signal when present, never assume its absence means a clean
+        # history. Handle a couple of plausible shapes defensively rather
+        # than trusting one guessed structure.
+        creator = data.get("creator")
+        creator_balance = data.get("creatorBalance")
+        creator_tokens_raw = data.get("creatorTokens")
+        prior_tokens = prior_rugged = None
+        if isinstance(creator_tokens_raw, list):
+            prior_tokens = len(creator_tokens_raw)
+            prior_rugged = sum(
+                1 for t in creator_tokens_raw
+                if isinstance(t, dict) and (t.get("rugged") or t.get("isRugged"))
+            )
+            if prior_rugged:
+                gates.append(f"deployer_rugged_{prior_rugged}_prior_token"
+                             f"{'s' if prior_rugged != 1 else ''}")
+            elif prior_tokens and prior_tokens >= 5:
+                flags.append(f"deployer_serial_launcher_{prior_tokens}_tokens")
+
+        # --- Insider / connected-wallet clusters -------------------------
+        # RugCheck clusters wallets it believes are connected (funded from
+        # the same source, transferred between each other, etc). A large
+        # cluster holding a meaningful chunk of supply is exactly the
+        # "5,000 holders but a handful of real owners" trap.
+        insider_networks = data.get("insiderNetworks") or []
+        insiders_detected = data.get("graphInsidersDetected")
+        total_supply_amt = None
+        top_holders = data.get("topHolders") or []
+        insider_pct = None
+        if top_holders:
+            insider_pct = sum(
+                float(h.get("pct") or 0) for h in top_holders if h.get("insider")
+            )
+            if insider_pct and insider_pct > 30:
+                gates.append(f"insider_wallets_hold_{insider_pct:.0f}pct")
+            elif insider_pct and insider_pct > 10:
+                flags.append(f"insider_wallets_hold_{insider_pct:.0f}pct")
+        elif insider_networks:
+            # No per-holder detail, but clusters were still detected.
+            flags.append(f"insider_clusters_detected_{len(insider_networks)}")
 
         # LP status is the single most predictive field here.
         #
@@ -140,8 +194,21 @@ class RugCheckAdapter(SourceAdapter):
         return SourceResult(
             self.name, ok=True, subscore=subscore, confidence=0.95,
             gate_failures=gates, flags=flags,
-            raw={"score": raw_score, "lp_locked_pct": lp_locked,
-                 "risks": data.get("risks")},
+            raw={
+                "score": raw_score,
+                "lp_locked_pct": lp_locked,
+                "risks": data.get("risks"),
+                "rugged": data.get("rugged"),
+                "creator": creator,
+                "creator_balance": creator_balance,
+                "prior_tokens": prior_tokens,
+                "prior_rugged": prior_rugged,
+                "insiders_detected": insiders_detected,
+                "insider_pct": insider_pct,
+                "insider_clusters": len(insider_networks),
+                "total_holders": data.get("totalHolders"),
+                "launchpad": (data.get("launchpad") or {}).get("name"),
+            },
         )
 
 
@@ -175,8 +242,46 @@ class GoPlusAdapter(SourceAdapter):
             gates.append("freeze_authority_active")
         if str(result.get("transfer_hook")) not in ("", "0", "None", "null"):
             flags.append("transfer_hook_present")
+
+        # closable: the developer can close the token program entirely,
+        # wiping every holder's balance. Per GoPlus's own docs this is not a
+        # cosmetic risk -- it is asset-destroying. Was previously a soft
+        # flag; that undersold it.
         if str((result.get("closable") or {}).get("status")) == "1":
-            flags.append("account_closable")
+            gates.append("token_program_closable")
+
+        # balance_mutable_authority: the developer can directly edit a
+        # holder's balance outside of normal transfers -- functionally a
+        # theft mechanism, not a risk to weigh against good news elsewhere.
+        if str((result.get("balance_mutable_authority") or {}).get("status")) == "1":
+            gates.append("balance_mutable_by_authority")
+
+        # non_transferable: "1" means the token literally cannot be sent —
+        # a hard honeypot, not a probabilistic one.
+        if str(result.get("non_transferable")) == "1":
+            gates.append("token_non_transferable")
+
+        # default_account_state == "2" means every new holder account is
+        # created frozen. Combined with an active freeze authority this is
+        # a live "nobody can sell" switch, not a theoretical risk.
+        if str(result.get("default_account_state")) == "2":
+            gates.append("accounts_frozen_by_default")
+
+        # GoPlus keeps its own blacklist of known-malicious deployer
+        # addresses -- when it flags this token's own creator, trust it.
+        creator_info = result.get("creator") or {}
+        if isinstance(creator_info, dict) and str(creator_info.get("malicious")) == "1":
+            gates.append("creator_flagged_malicious_by_goplus")
+
+        # Transfer-fee (buy/sell tax) extension. GoPlus's exact fee-rate
+        # field names for this are unconfirmed against a live populated
+        # example (only saw it empty on tokens without the extension) --
+        # rather than guess a percentage and risk repeating the RugCheck
+        # lp_locked_pct mistake, only flag that the mechanism exists and
+        # expose the raw block so a human can read the real numbers.
+        transfer_fee = result.get("transfer_fee") or {}
+        if transfer_fee:
+            flags.append("transfer_fee_extension_present")
 
         holders = result.get("holders") or []
         top_pct = 0.0
@@ -194,13 +299,42 @@ class GoPlusAdapter(SourceAdapter):
         elif top_pct > 35:
             flags.append(f"concentrated_top10_{top_pct:.0f}pct")
 
+        # Second opinion on LP lock, straight from GoPlus's own lp_holders
+        # list -- independent of RugCheck's lockers/markets data. When the
+        # two disagree that is itself worth surfacing, not averaging away.
+        lp_holders = result.get("lp_holders") or []
+        lp_locked_pct_goplus = None
+        if lp_holders:
+            locked = 0.0
+            for h in lp_holders:
+                try:
+                    pct = float(h.get("percent") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if pct <= 1.0:
+                    pct *= 100
+                if str(h.get("is_locked")) in ("1", "True", "true"):
+                    locked += pct
+            lp_locked_pct_goplus = locked
+
         subscore = clamp(1.0 - scale(top_pct, 15, 70))
 
         return SourceResult(
             self.name, ok=True, subscore=subscore, confidence=0.85,
             gate_failures=gates, flags=flags,
-            raw={"top10_pct": top_pct, "mintable": result.get("mintable"),
-                 "freezable": result.get("freezable")},
+            raw={
+                "top10_pct": top_pct,
+                "mintable": result.get("mintable"),
+                "freezable": result.get("freezable"),
+                "closable": result.get("closable"),
+                "balance_mutable_authority": result.get("balance_mutable_authority"),
+                "non_transferable": result.get("non_transferable"),
+                "default_account_state": result.get("default_account_state"),
+                "creator_malicious": creator_info.get("malicious") if isinstance(creator_info, dict) else None,
+                "transfer_fee_present": bool(transfer_fee),
+                "holder_count": result.get("holder_count"),
+                "lp_locked_pct": lp_locked_pct_goplus,
+            },
         )
 
 
