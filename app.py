@@ -121,6 +121,139 @@ async def api_score(address: str = Query(..., min_length=2, max_length=64)):
     )
 
 
+# --------------------------------------------------------------------------
+# Arbitrage spread scanner.
+#
+# This is READ-ONLY -- it shows where a token's price disagrees across its
+# own pools, it does not touch a wallet or place trades. Deliberately scoped
+# that way: an auto-executing version needs private-key custody and has to
+# survive gas/slippage/MEV risk, a different order of build and risk
+# entirely from everything else in this project.
+#
+# Also worth being honest about up front: the spreads here are GROSS, before
+# swap fees (which vary per DEX and even per pool) and before price impact
+# on either leg. Real cross-DEX arbitrage on Solana is dominated by bots
+# operating in milliseconds -- by the time a human sees a spread here and
+# manually executes two swaps, it has very likely already closed or
+# reversed. Treat this as a way to spot a persistently stale/illiquid pool
+# worth a manual look, not a reliable, actionable profit signal.
+# --------------------------------------------------------------------------
+
+def _pair_price_usd(pair: dict) -> float | None:
+    try:
+        price = pair.get("priceUsd")
+        return float(price) if price is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _arbitrage_for_address(address: str, min_liquidity: float) -> dict:
+    async with DexScreener() as ds:
+        pairs = await ds.token_pairs(address)
+
+    legs = []
+    for p in pairs:
+        if p.get("chainId") != "solana":
+            continue
+        liq = (p.get("liquidity") or {}).get("usd") or 0
+        price = _pair_price_usd(p)
+        if price is None or price <= 0 or liq < min_liquidity:
+            continue
+        legs.append({
+            "dex": p.get("dexId"),
+            "pair_address": p.get("pairAddress"),
+            "quote_symbol": (p.get("quoteToken") or {}).get("symbol"),
+            "price_usd": price,
+            "liquidity_usd": liq,
+            "volume_h24": (p.get("volume") or {}).get("h24"),
+            "url": p.get("url"),
+        })
+    legs.sort(key=lambda leg: leg["price_usd"])
+
+    spread_pct = None
+    if len(legs) >= 2 and legs[0]["price_usd"] > 0:
+        spread_pct = (legs[-1]["price_usd"] - legs[0]["price_usd"]) / legs[0]["price_usd"] * 100
+
+    return {
+        "legs": legs,
+        "spread_pct": round(spread_pct, 2) if spread_pct is not None else None,
+        "pools_total": len(pairs),
+        "pools_considered": len(legs),
+    }
+
+
+@app.get("/api/arbitrage")
+async def api_arbitrage(
+    address: str = Query(..., min_length=2, max_length=64),
+    min_liquidity: float = Query(2000, ge=0),
+):
+    query = address.strip()
+    resolved_address, matched_symbol = await _resolve_to_address(query)
+    try:
+        data = await _arbitrage_for_address(resolved_address, min_liquidity)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"couldn't pull pool data: {exc}") from exc
+
+    return JSONResponse({
+        "address": resolved_address,
+        "queried_as": query,
+        "matched_symbol": matched_symbol,
+        **data,
+    })
+
+
+async def _arbitrage_scan(source: str, limit: int, min_spread: float, min_liquidity: float) -> list[dict]:
+    try:
+        async with DexScreener() as ds:
+            entries = await (ds.top_boosts() if source == "alpha" else ds.latest_boosts())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"couldn't pull the candidate list: {exc}") from exc
+
+    seen: set[str] = set()
+    addresses: list[str] = []
+    for e in entries:
+        if e.get("chainId") != "solana":
+            continue
+        addr = extract_address(e)
+        if addr and addr not in seen:
+            seen.add(addr)
+            addresses.append(addr)
+    addresses = addresses[:limit]
+
+    async def one(addr: str):
+        async with SCAN_SEMAPHORE:
+            try:
+                data = await _arbitrage_for_address(addr, min_liquidity)
+            except Exception:  # noqa: BLE001 - one bad token shouldn't sink the scan
+                return None
+        if data["spread_pct"] is None or data["spread_pct"] < min_spread:
+            return None
+        return {"address": addr, **data}
+
+    rows = await asyncio.gather(*(one(a) for a in addresses))
+    passed = [r for r in rows if r]
+    passed.sort(key=lambda r: r["spread_pct"], reverse=True)
+    return passed
+
+
+@app.get("/api/arbitrage_scan")
+async def api_arbitrage_scan(
+    source: str = Query("alpha", pattern="^(alpha|screen)$"),
+    min_spread: float = Query(2.0, ge=0, le=100),
+    min_liquidity: float = Query(2000, ge=0),
+    limit: int = Query(20, ge=1, le=30),
+):
+    passed = await _arbitrage_scan(source, limit, min_spread, min_liquidity)
+    return JSONResponse({
+        "evaluated": limit,
+        "passed": passed,
+        "filters": {
+            "source": source, "min_spread": min_spread,
+            "min_liquidity": min_liquidity, "limit": limit,
+        },
+    })
+
+
 @app.get("/api/pools")
 async def api_pools(q: str = Query(..., min_length=1, max_length=64)):
     try:
@@ -459,6 +592,7 @@ INDEX_HTML = r"""<!doctype html>
       <button class="tab" id="tab-score" role="tab" aria-selected="true">Check a token</button>
       <button class="tab" id="tab-pools" role="tab" aria-selected="false">Search pools</button>
       <button class="tab" id="tab-scan" role="tab" aria-selected="false">Scan for buys</button>
+      <button class="tab" id="tab-arb" role="tab" aria-selected="false">Arbitrage</button>
     </div>
 
     <div class="panel active" id="panel-score">
@@ -505,6 +639,49 @@ INDEX_HTML = r"""<!doctype html>
       <p class="hint">Every candidate gets the full multi-source scorecard before filtering &mdash; this is not a raw popularity list. Click when you want a fresh read; each scan is dozens of live API calls, so it's meant to be run deliberately, not on a timer.</p>
       <div id="scan-result"></div>
     </div>
+
+    <div class="panel" id="panel-arb">
+      <p class="hint" style="margin-bottom:16px;">
+        Read-only spread check across a token's own pools &mdash; nothing here touches a wallet or places a trade.
+        Spreads shown are <b>gross</b>: before swap fees (which vary per DEX/pool) and before price impact on either leg.
+        Real cross-DEX arbitrage on Solana runs at bot speed, in milliseconds &mdash; by the time a human sees a spread
+        here and executes two manual swaps, it has very likely already closed or reversed. Treat this as a way to spot
+        a persistently stale or illiquid pool worth a manual look, not a reliable, actionable profit signal.
+      </p>
+
+      <div class="search-row">
+        <input type="text" id="arb-input" placeholder="Name, ticker, or mint address" autocomplete="off">
+        <button id="arb-btn">Check spread</button>
+      </div>
+      <div class="filter-grid">
+        <label>Min liquidity per pool
+          <input type="number" id="arb-min-liq" value="2000" min="0" step="500">
+        </label>
+      </div>
+      <div id="arb-result"></div>
+
+      <div class="section-title" style="margin-top:26px;">Scan boosted tokens for spreads</div>
+      <div class="filter-grid">
+        <label>List
+          <select id="arb-scan-source">
+            <option value="alpha">Top boosted (alpha)</option>
+            <option value="screen">Latest boosted (screen)</option>
+          </select>
+        </label>
+        <label>Min spread %
+          <input type="number" id="arb-scan-min-spread" value="2" min="0" max="100" step="0.5">
+        </label>
+        <label>Min liquidity per pool
+          <input type="number" id="arb-scan-min-liq" value="2000" min="0" step="500">
+        </label>
+        <label>Tokens to scan
+          <input type="number" id="arb-scan-limit" value="20" min="5" max="30" step="5">
+        </label>
+      </div>
+      <button id="arb-scan-btn" style="width:100%; margin-top:4px;">Scan now</button>
+      <p class="hint">Same caveats as above, applied across the boosted-token list. Click when you want a fresh read &mdash; each scan is dozens of live API calls.</p>
+      <div id="arb-scan-result"></div>
+    </div>
   </div>
 
   <footer>
@@ -516,7 +693,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 
-const TABS = ['score', 'pools', 'scan'];
+const TABS = ['score', 'pools', 'scan', 'arb'];
 function switchTab(which) {
   TABS.forEach(name => {
     const isActive = name === which;
@@ -535,6 +712,13 @@ function money(v) {
 }
 function shortAddr(a) {
   return a && a.length > 12 ? a.slice(0, 4) + '…' + a.slice(-4) : a;
+}
+function priceFmt(v) {
+  if (v === null || v === undefined) return '?';
+  const n = Number(v);
+  if (Math.abs(n) >= 1) return '$' + n.toFixed(4);
+  if (Math.abs(n) >= 0.0001) return '$' + n.toFixed(6);
+  return '$' + n.toFixed(10).replace(/0+$/, '');
 }
 function explorerLinks(address) {
   const links = [
@@ -796,6 +980,124 @@ function renderScan(data) {
 }
 
 $('scan-btn').addEventListener('click', runScan);
+
+function spreadColor(pct) {
+  if (pct === null || pct === undefined) return roleColor('warning');
+  if (pct >= 8) return roleColor('serious');
+  if (pct >= 2) return roleColor('good');
+  return roleColor('warning');
+}
+
+async function runArbitrage() {
+  const query = $('arb-input').value.trim();
+  const minLiq = $('arb-min-liq').value;
+  const out = $('arb-result');
+  if (!query) { out.innerHTML = '<div class="error-box">Enter a name, ticker, or address first.</div>'; return; }
+
+  $('arb-btn').disabled = true;
+  out.innerHTML = '<div class="spinner">Pulling pools…</div>';
+
+  try {
+    const params = new URLSearchParams({ address: query, min_liquidity: minLiq });
+    const res = await fetch('/api/arbitrage?' + params.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+    renderArbitrage(data);
+  } catch (err) {
+    out.innerHTML = '<div class="error-box">' + (err.message || 'Something went wrong') + '</div>';
+  } finally {
+    $('arb-btn').disabled = false;
+  }
+}
+
+function renderArbitrage(v) {
+  const out = $('arb-result');
+  let html = '<div class="result">';
+
+  if (v.matched_symbol) {
+    html += '<p class="hint" style="margin-bottom:12px">Matched "' + v.queried_as + '" &rarr; <b>' + v.matched_symbol + '</b> (highest-liquidity pool on DexScreener). Not the token you meant? Search it on "Search pools" and paste the exact address instead.</p>';
+  }
+
+  html += '<div class="addr">' + v.address + '</div>';
+  html += explorerLinks(v.address);
+
+  if (v.spread_pct === null || v.legs.length < 2) {
+    html += '<div class="empty">Not enough qualifying pools to compute a spread (need at least 2 above the liquidity floor). '
+      + v.pools_considered + ' of ' + v.pools_total + ' pool(s) cleared the liquidity floor.</div>';
+    out.innerHTML = html + '</div>';
+    return;
+  }
+
+  html += '<div class="score-num" style="color:' + spreadColor(v.spread_pct) + '">' + v.spread_pct.toFixed(2) + '<small>% gross spread</small></div>';
+  html += '<p class="note">' + v.pools_considered + ' of ' + v.pools_total + ' pools cleared the liquidity floor, ranked lowest to highest price. Spread is gross &mdash; before fees and slippage.</p>';
+
+  html += '<div class="section-title">Pools, low &rarr; high price</div>';
+  v.legs.forEach((leg, i) => {
+    const tag = i === 0 ? ' (lowest)' : (i === v.legs.length - 1 ? ' (highest)' : '');
+    html += '<div class="pool-card">'
+      + '<div class="pool-title">' + (leg.dex || '?') + ' &middot; vs ' + (leg.quote_symbol || '?') + tag + '</div>'
+      + '<div class="pool-meta">' + priceFmt(leg.price_usd) + ' &middot; liq ' + money(leg.liquidity_usd) + ' &middot; vol24 ' + money(leg.volume_h24) + '</div>'
+      + (leg.url ? '<div class="link-row"><a class="link-chip" href="' + leg.url + '" target="_blank" rel="noopener noreferrer">View pool ↗</a></div>' : '')
+      + '</div>';
+  });
+
+  out.innerHTML = html + '</div>';
+}
+
+$('arb-btn').addEventListener('click', runArbitrage);
+$('arb-input').addEventListener('keydown', e => { if (e.key === 'Enter') runArbitrage(); });
+
+async function runArbitrageScan() {
+  const source = $('arb-scan-source').value;
+  const minSpread = $('arb-scan-min-spread').value;
+  const minLiq = $('arb-scan-min-liq').value;
+  const limit = $('arb-scan-limit').value;
+  const out = $('arb-scan-result');
+
+  $('arb-scan-btn').disabled = true;
+  $('arb-scan-btn').textContent = 'Scanning ' + limit + ' tokens…';
+  out.innerHTML = '<div class="spinner">Pulling pools across candidates — this can take a little while.</div>';
+
+  try {
+    const params = new URLSearchParams({ source, min_spread: minSpread, min_liquidity: minLiq, limit });
+    const res = await fetch('/api/arbitrage_scan?' + params.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Request failed');
+    renderArbitrageScan(data);
+  } catch (err) {
+    out.innerHTML = '<div class="error-box">' + (err.message || 'Something went wrong') + '</div>';
+  } finally {
+    $('arb-scan-btn').disabled = false;
+    $('arb-scan-btn').textContent = 'Scan now';
+  }
+}
+
+function renderArbitrageScan(data) {
+  const out = $('arb-scan-result');
+  let html = '<p class="note">' + data.filters.limit + ' candidates checked &middot; ' + data.passed.length + ' cleared the min-spread filter, ranked by spread.</p>';
+
+  if (!data.passed.length) {
+    html += '<div class="empty">Nothing cleared the bar this round &mdash; that\'s a valid result, not an error. Try again shortly or loosen the filters.</div>';
+    out.innerHTML = html;
+    return;
+  }
+
+  data.passed.forEach((r, i) => {
+    html += '<div class="scan-row">'
+      + '<div class="scan-rank">' + (i + 1) + '</div>'
+      + '<div>'
+      + '<div class="pool-addr" style="margin-top:0">' + r.address + '</div>'
+      + '<div class="pool-meta">' + r.pools_considered + ' of ' + r.pools_total + ' pools considered</div>'
+      + explorerLinks(r.address)
+      + '</div>'
+      + '<div class="scan-score" style="color:' + spreadColor(r.spread_pct) + '">' + r.spread_pct.toFixed(2)
+      + '<small>% spread</small></div>'
+      + '</div>';
+  });
+  out.innerHTML = html;
+}
+
+$('arb-scan-btn').addEventListener('click', runArbitrageScan);
 </script>
 </body>
 </html>
